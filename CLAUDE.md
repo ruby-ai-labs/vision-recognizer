@@ -43,5 +43,9 @@ cargo install --path . --locked
 ./scripts/post-install.sh
 ```
 
+`scripts/post-install.sh` подписывает бинари семейным сертификатом `ruby-ai-labs-dev`
+(fallback: `voice-transcribe-dev`, затем ad-hoc). Создание сертификата:
+`handbook/manuals/family-codesign-cert.md`.
+
 `OPENAI_API_KEY` должен быть доступен в env при старте сервера.
 В контексте `personal-assistant` — через `secrets-vault run -- claude`.
