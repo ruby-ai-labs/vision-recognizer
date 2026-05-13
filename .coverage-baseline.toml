@@ -1,0 +1,10 @@
+# Coverage baseline — pinned at initial scaffold (issue-62)
+# 16 tests, cargo llvm-cov --all-features --locked --summary-only
+# Date: 2026-05-13
+# Ratchet up: raise threshold when new tests bring coverage above this baseline.
+# Do NOT lower without explicit rationale in commit body.
+#
+# main.rs 0% lines — CLI entry, no unit tests (I/O glue); covered by MCP integration test.
+# main_mcp.rs 85.71% lines — binary entry; error path (process::exit) not reachable in tests.
+[baseline]
+threshold = 85

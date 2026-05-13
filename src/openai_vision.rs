@@ -1,7 +1,9 @@
 //! `OpenAI` Vision API client — sends images to `POST /v1/chat/completions`
 //! using the `image_url` content type with base64-encoded data URLs.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::Deserialize;
 use std::path::Path;
 
 /// Thin wrapper around the `OpenAI` Chat Completions endpoint for vision.
@@ -37,8 +39,18 @@ impl VisionClient {
     /// # Errors
     ///
     /// Returns an error for unsupported or HEIC formats.
-    pub(crate) fn mime_for_ext(_ext: &str) -> Result<&'static str> {
-        todo!("implement mime_for_ext")
+    pub(crate) fn mime_for_ext(ext: &str) -> Result<&'static str> {
+        match ext.to_lowercase().as_str() {
+            "jpg" | "jpeg" => Ok("image/jpeg"),
+            "png" => Ok("image/png"),
+            "webp" => Ok("image/webp"),
+            "gif" => Ok("image/gif"),
+            "heic" | "heif" => bail!(
+                "HEIC format is not supported by OpenAI Vision API. \
+                 Send JPEG or PNG instead."
+            ),
+            other => bail!("unsupported image format: .{other} — use jpeg, png, webp, or gif"),
+        }
     }
 
     /// Analyse an image file using `OpenAI` Vision.
@@ -49,14 +61,87 @@ impl VisionClient {
     ///
     /// Returns an error if the file cannot be read, the format is unsupported,
     /// the HTTP request fails, or the API returns a non-2xx status code.
-    pub async fn recognize(
-        &self,
-        _image_path: &Path,
-        _prompt: &str,
-        _model: &str,
-    ) -> Result<String> {
-        todo!("implement recognize")
+    pub async fn recognize(&self, image_path: &Path, prompt: &str, model: &str) -> Result<String> {
+        let bytes = tokio::fs::read(image_path)
+            .await
+            .with_context(|| format!("cannot read image file: {}", image_path.display()))?;
+
+        let ext = image_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let mime = Self::mime_for_ext(ext)?;
+        let encoded = STANDARD.encode(&bytes);
+        let data_url = format!("data:{mime};base64,{encoded}");
+
+        let payload = serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url,
+                            "detail": "auto"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }],
+            "max_tokens": 1024
+        });
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .context("HTTP request to OpenAI Vision API failed")?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read OpenAI Vision API response body")?;
+
+        if !status.is_success() {
+            bail!("OpenAI Vision API error {status}: {body}");
+        }
+
+        // Extract choices[0].message.content
+        let parsed: ChatResponse =
+            serde_json::from_str(&body).context("failed to parse OpenAI Vision API response")?;
+
+        parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .context("OpenAI Vision API response contained no content")
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: Message,
+}
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    content: Option<String>,
 }
 
 #[cfg(test)]
@@ -98,10 +183,7 @@ mod tests {
         let result = VisionClient::mime_for_ext("heic");
         assert!(result.is_err(), "heic must return Err");
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("HEIC"),
-            "error must mention HEIC, got: {msg}"
-        );
+        assert!(msg.contains("HEIC"), "error must mention HEIC, got: {msg}");
         assert!(
             msg.contains("JPEG") || msg.contains("PNG"),
             "error must suggest JPEG or PNG, got: {msg}"
@@ -122,7 +204,6 @@ mod tests {
     /// AC6: base64 round-trip — encode then decode returns original bytes.
     #[test]
     fn base64_roundtrip_small_png() -> Result<()> {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let original = b"\x89PNG\r\n\x1a\nhello test bytes";
         let encoded = STANDARD.encode(original);
         let decoded = STANDARD.decode(&encoded).context("base64 decode failed")?;
@@ -151,8 +232,8 @@ mod tests {
         assert!(result.is_err(), "expected Err for missing file");
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
-            msg.contains("cannot read image file") || msg.contains("not yet implemented"),
-            "error message must be relevant, got: {msg}"
+            msg.contains("cannot read image file"),
+            "error message must mention 'cannot read image file', got: {msg}"
         );
         Ok(())
     }

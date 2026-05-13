@@ -71,18 +71,21 @@ impl VisionHandler {
         &self,
         Parameters(input): Parameters<RecognizeImageInput>,
     ) -> Result<Json<RecognizeImageOutput>, ErrorData> {
-        let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-            ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None)
-        })?;
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
 
-        let _client = VisionClient::new(api_key, "https://api.openai.com")
+        let client = VisionClient::new(api_key, "https://api.openai.com")
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        // Stub — will be replaced in feat commit
-        Err(ErrorData::internal_error(
-            format!("not yet implemented: {}", input.image_path),
-            None,
-        ))
+        let model = input.model.as_deref().unwrap_or("gpt-4o-mini");
+        let path = std::path::PathBuf::from(&input.image_path);
+
+        let text = client
+            .recognize(&path, &input.prompt, model)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(Json(RecognizeImageOutput { text }))
     }
 }
 
