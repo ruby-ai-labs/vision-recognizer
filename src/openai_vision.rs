@@ -214,14 +214,14 @@ mod tests {
     /// AC6: client construction succeeds.
     #[test]
     fn client_new_does_not_panic() -> Result<()> {
-        VisionClient::new("sk-test", "http://localhost:8080")?;
+        VisionClient::new("dummy-api-key", "http://localhost:8080")?;
         Ok(())
     }
 
     /// AC6: `recognize` returns Err for missing file.
     #[tokio::test]
     async fn recognize_missing_file_returns_err() -> Result<()> {
-        let client = VisionClient::new("sk-test", "http://localhost:9999")?;
+        let client = VisionClient::new("dummy-api-key", "http://localhost:9999")?;
         let result = client
             .recognize(
                 Path::new("/tmp/this-file-does-not-exist-vision-recognizer.png"),
