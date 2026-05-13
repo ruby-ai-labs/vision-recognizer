@@ -1,6 +1,5 @@
 verbose = "info"
 include_verbatim = false
-include_fragments = true
 max_redirects = 5
 max_concurrency = 16
 timeout = 20

@@ -25,11 +25,13 @@ pick_cert() {
 }
 
 CERT=$(pick_cert)
-if [ "$CERT" = "-" ]; then
+if [ "$CERT" = "ruby-ai-labs-dev" ]; then
+  echo "INFO: используется family cert 'ruby-ai-labs-dev'."
+elif [ "$CERT" = "voice-transcribe-dev" ]; then
+  echo "WARN: используется legacy cert 'voice-transcribe-dev'. Создай family cert ruby-ai-labs-dev: см. handbook/manuals/family-codesign-cert.md" >&2
+else
   echo "WARN: именованный сертификат не найден, использую ad-hoc подпись (стабильная identity, без Keychain prompt)." >&2
   echo "Создать сертификат: handbook/manuals/family-codesign-cert.md" >&2
-else
-  echo "INFO: используется сертификат '$CERT'."
 fi
 
 for bin in "${BINS[@]}"; do
