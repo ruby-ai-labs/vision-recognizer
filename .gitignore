@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Cargo.lock policy: binary crate — committed (do NOT gitignore)
+
+# Coverage + mutation artifacts (local-only, не commit-ить)
+lcov.info
+mutants.out/

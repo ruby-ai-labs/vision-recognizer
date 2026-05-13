@@ -1,0 +1,30 @@
+# gitleaks config — allowlist для известных false-positives.
+# Source of truth — handbook/manuals/security-audit.md.
+
+title = "vault gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false-positives и safe patterns в vault-е"
+paths = [
+  '''(?i)\.git/.*''',
+  '''node_modules/.*''',
+  '''target/.*''',
+  '''dist/.*''',
+]
+
+# Regex-allowlist для конкретных false-positives.
+regexes = []
+
+# Stopwords — слова после которых строка считается example/placeholder.
+stopwords = [
+  "example",
+  "placeholder",
+  "<token>",
+  "<your-",
+  "REDACTED",
+  "your-",
+  "<vault-leak-redacted>",
+]
