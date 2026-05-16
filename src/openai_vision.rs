@@ -346,7 +346,7 @@ mod tests {
             tmp_files.push(tmp);
         }
 
-        let client = VisionClient::new("sk-test", mock_server.uri())?;
+        let client = VisionClient::new("dummy-api-key", mock_server.uri())?;
         let text = client
             .recognize_sequence(&frame_paths, "describe movement", "gpt-4o")
             .await?;
@@ -390,7 +390,7 @@ mod tests {
     /// AC7 edge case: `recognize_sequence` with empty frames slice returns Err.
     #[tokio::test]
     async fn recognize_sequence_empty_frames() -> Result<()> {
-        let client = VisionClient::new("sk-test", "http://localhost:19999")?;
+        let client = VisionClient::new("dummy-api-key", "http://localhost:19999")?;
         let result = client
             .recognize_sequence(&[], "describe movement", "gpt-4o")
             .await;
