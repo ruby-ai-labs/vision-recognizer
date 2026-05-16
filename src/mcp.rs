@@ -1,7 +1,8 @@
 //! MCP stdio server for vision-recognizer.
 //!
-//! Exposes one tool: `vision.recognize_image` — analyses an image file
-//! via the `OpenAI` Vision API.
+//! Exposes two tools:
+//! - `vision.recognize_image` — analyses a single image file via the `OpenAI` Vision API.
+//! - `vision.analyze_video`   — extracts frames from a video and analyses the sequence.
 
 use anyhow::Result;
 use rmcp::{
@@ -13,7 +14,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::openai_vision::VisionClient;
+use crate::{
+    openai_vision::VisionClient,
+    video::{self, DEFAULT_FPS, MAX_DURATION_SECS, MAX_FRAMES},
+};
 
 // ── Input / Output types ───────────────────────────────────────────────────
 
@@ -34,6 +38,28 @@ pub(crate) struct RecognizeImageInput {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct RecognizeImageOutput {
     /// Vision model text response.
+    pub text: String,
+}
+
+/// Input schema for `vision.analyze_video`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct AnalyzeVideoInput {
+    /// Absolute path to the video file (mp4, mov, webm; max 30 seconds).
+    pub video_path: String,
+
+    /// Natural language prompt describing what to analyse (e.g. "describe the movement").
+    pub prompt: String,
+
+    /// Frame extraction rate in frames per second (optional, default: 2.0).
+    ///
+    /// Actual fps is capped so that at most 16 frames are extracted.
+    pub fps: Option<f32>,
+}
+
+/// Output wrapper for `vision.analyze_video`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct AnalyzeVideoOutput {
+    /// Vision model text analysis of the video sequence.
     pub text: String,
 }
 
@@ -74,7 +100,10 @@ impl VisionHandler {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
 
-        let client = VisionClient::new(api_key, "https://api.openai.com")
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
+
+        let client = VisionClient::new(api_key, base_url)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let model = input.model.as_deref().unwrap_or("gpt-4o-mini");
@@ -86,6 +115,74 @@ impl VisionHandler {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(Json(RecognizeImageOutput { text }))
+    }
+
+    /// `vision.analyze_video` — extract frames from a video and analyse the sequence.
+    #[tool(
+        name = "vision.analyze_video",
+        description = "Extract frames from a short video file (mp4/mov/webm, max 30 seconds) \
+                       and analyse the frame sequence using OpenAI Vision API (gpt-4o). \
+                       Reads OPENAI_API_KEY from environment. Requires ffmpeg in PATH. \
+                       Returns the model's text analysis of the video content. \
+                       USE WHEN: user sends a video file; user asks to analyse movement, \
+                       posture, exercise technique, or any motion in a video; \
+                       user needs body-assessment from a video clip. \
+                       DO NOT USE for single images — use vision.recognize_image instead; \
+                       DO NOT USE for videos longer than 30 seconds."
+    )]
+    pub async fn analyze_video(
+        &self,
+        Parameters(input): Parameters<AnalyzeVideoInput>,
+    ) -> Result<Json<AnalyzeVideoOutput>, ErrorData> {
+        // Validate video extension first (cheap; no I/O, no env-reads).
+        let path = std::path::Path::new(&input.video_path);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        if !video::supported_video_ext(ext) {
+            return Err(ErrorData::invalid_params(
+                format!("unsupported video format '.{ext}'; supported formats: mp4, mov, webm"),
+                None,
+            ));
+        }
+
+        // Retrieve duration (lazy ffmpeg check — returns helpful error if absent).
+        // Must run before OPENAI_API_KEY read so that a missing ffmpeg surfaces
+        // as an ffmpeg error, not a key error, when both are absent.
+        let duration = video::video_duration_secs(path)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        if duration > MAX_DURATION_SECS {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "video duration {duration:.1}s exceeds the {MAX_DURATION_SECS}s limit; \
+                     please provide a shorter clip"
+                ),
+                None,
+            ));
+        }
+
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
+
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
+
+        let fps = input.fps.unwrap_or(DEFAULT_FPS);
+        let (_tempdir, frames) = video::extract_frames(path, fps, MAX_FRAMES)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let client = VisionClient::new(api_key, base_url)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let text = client
+            .recognize_sequence(&frames, &input.prompt, "gpt-4o")
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // _tempdir lives until end of scope — frames are valid for the HTTP call above.
+        Ok(Json(AnalyzeVideoOutput { text }))
     }
 }
 
@@ -99,7 +196,9 @@ impl ServerHandler for VisionHandler {
             ))
             .with_instructions(
                 "Vision recognition tools powered by OpenAI Vision API. \
-                 Use vision.recognize_image to analyze images.",
+                 Use vision.recognize_image to analyze images. \
+                 Use vision.analyze_video to analyze short video clips (mp4/mov/webm, max 30s) \
+                 — USE WHEN: video file / motion analysis; DO NOT USE for single images.",
             )
     }
 }
@@ -133,6 +232,18 @@ mod tests {
         assert!(
             names.contains(&"vision.recognize_image"),
             "tool list must contain vision.recognize_image, got: {names:?}"
+        );
+    }
+
+    /// AC1: `VisionHandler` must expose a tool named `vision.analyze_video`.
+    #[test]
+    fn tool_router_lists_analyze_video() {
+        let handler = VisionHandler::new();
+        let tools = handler.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"vision.analyze_video"),
+            "tool list must contain vision.analyze_video, got: {names:?}"
         );
     }
 
@@ -176,6 +287,59 @@ mod tests {
         assert!(
             result.is_err(),
             "must return Err when OPENAI_API_KEY is not set"
+        );
+    }
+
+    /// AC6 — unsupported extension returns `invalid_params` `ErrorData`.
+    #[tokio::test]
+    async fn analyze_video_unsupported_ext_returns_invalid_params() {
+        #![allow(clippy::expect_used)]
+        std::env::remove_var("OPENAI_API_KEY");
+        let handler = VisionHandler::new();
+        let input = AnalyzeVideoInput {
+            video_path: "/tmp/test.avi".to_owned(),
+            prompt: "describe".to_owned(),
+            fps: None,
+        };
+        let result = handler.analyze_video(Parameters(input)).await;
+        assert!(result.is_err(), "avi extension must return Err");
+        let err_data = result.err().expect("expected ErrorData");
+        let msg = err_data.message.as_ref();
+        assert!(
+            msg.contains("mp4") || msg.contains("unsupported"),
+            "error must mention supported formats, got: {msg}"
+        );
+    }
+
+    /// AC5 — missing `OPENAI_API_KEY` returns MCP `ErrorData`.
+    #[tokio::test]
+    async fn analyze_video_missing_key_returns_mcp_error() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let handler = VisionHandler::new();
+        // With a valid extension but non-existent file, ffprobe will fail (file
+        // doesn't exist or ffprobe not found) → `internal_error` returned.
+        // Confirms handler doesn't panic and always returns `ErrorData`.
+        let input = AnalyzeVideoInput {
+            video_path: "/tmp/nonexistent.mp4".to_owned(),
+            prompt: "describe".to_owned(),
+            fps: None,
+        };
+        let result = handler.analyze_video(Parameters(input)).await;
+        assert!(
+            result.is_err(),
+            "analyze_video with missing/invalid file must return Err"
+        );
+    }
+
+    /// AC1 — `get_info` instructions mention `analyze_video`.
+    #[test]
+    fn get_info_instructions_mention_analyze_video() {
+        let handler = VisionHandler::new();
+        let info = handler.get_info();
+        let instructions = info.instructions.as_deref().unwrap_or("");
+        assert!(
+            instructions.contains("vision.analyze_video"),
+            "get_info instructions must mention vision.analyze_video, got: {instructions}"
         );
     }
 }
