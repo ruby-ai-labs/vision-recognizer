@@ -53,6 +53,94 @@ impl VisionClient {
         }
     }
 
+    /// Analyse a sequence of image frames using `OpenAI` Vision.
+    ///
+    /// Builds a single `messages[0].content` array with one `image_url` item per
+    /// frame followed by one `text` item containing `prompt`.  All frames are
+    /// assumed to be JPEG (as produced by `video::extract_frames`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `frames` is empty, any frame file cannot be read, the
+    /// HTTP request fails, or the API returns a non-2xx status code.
+    pub async fn recognize_sequence(
+        &self,
+        frames: &[std::path::PathBuf],
+        prompt: &str,
+        model: &str,
+    ) -> Result<String> {
+        if frames.is_empty() {
+            anyhow::bail!("frames slice is empty — at least one frame is required");
+        }
+
+        let mut content: Vec<serde_json::Value> = Vec::with_capacity(frames.len() + 1);
+
+        for frame_path in frames {
+            let item = Self::build_image_item(frame_path).await?;
+            content.push(item);
+        }
+        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+
+        let payload = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": content }],
+            "max_tokens": 1024
+        });
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .context("HTTP request to OpenAI Vision API failed")?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read OpenAI Vision API response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("OpenAI Vision API error {status}: {body}");
+        }
+
+        let parsed: ChatResponse =
+            serde_json::from_str(&body).context("failed to parse OpenAI Vision API response")?;
+
+        parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .context("OpenAI Vision API response contained no content")
+    }
+
+    /// Build a single `image_url` content item from a local image file.
+    ///
+    /// Reads the file, base64-encodes it, and wraps it in the `OpenAI`
+    /// `image_url` object format.  Uses `mime_for_ext` for the MIME type; if
+    /// the extension is missing falls back to `image/jpeg` (as produced by
+    /// `extract_frames`).
+    async fn build_image_item(path: &Path) -> Result<serde_json::Value> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("cannot read frame file: {}", path.display()))?;
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+        let mime = Self::mime_for_ext(ext).unwrap_or("image/jpeg");
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let data_url = format!("data:{mime};base64,{encoded}");
+
+        Ok(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": data_url, "detail": "auto" }
+        }))
+    }
+
     /// Analyse an image file using `OpenAI` Vision.
     ///
     /// Returns the model's text response.
@@ -242,14 +330,11 @@ mod tests {
 
         // Create 3 minimal PNG temp files.
         let png_bytes: &[u8] = &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
-            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2,
-            0x21, 0xbc, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
-            0x82,
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ];
 
         let mut tmp_files: Vec<NamedTempFile> = Vec::new();
@@ -280,7 +365,11 @@ mod tests {
             .expect("content must be array");
 
         // Should be 3 image_url items + 1 text item = 4 total
-        assert_eq!(content.len(), 4, "expected 4 content items (3 images + 1 text)");
+        assert_eq!(
+            content.len(),
+            4,
+            "expected 4 content items (3 images + 1 text)"
+        );
 
         let image_items: Vec<&Value> = content
             .iter()

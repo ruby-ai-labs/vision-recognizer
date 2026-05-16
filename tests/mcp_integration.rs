@@ -55,6 +55,10 @@ fn tool_list_json_rpc_handshake() {
         tools_response.contains("vision.recognize_image"),
         "tools/list response must contain 'vision.recognize_image', got: {tools_response}"
     );
+    assert!(
+        tools_response.contains("vision.analyze_video"),
+        "tools/list response must contain 'vision.analyze_video', got: {tools_response}"
+    );
 
     // Graceful shutdown
     drop(child.stdin.take());
