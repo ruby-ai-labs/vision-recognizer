@@ -1,7 +1,7 @@
 //! Integration tests for the video frame extraction pipeline.
 //!
 //! These tests exercise `video::extract_frames` + `VisionClient::recognize_sequence`
-//! end-to-end against a wiremock mock of the OpenAI API.
+//! end-to-end against a wiremock mock of the `OpenAI` API.
 //!
 //! Tests that require `ffmpeg` call `skip_if_no_ffmpeg()` at the top of the
 //! test body and return early if the binary is absent — so the whole test suite
@@ -30,8 +30,7 @@ fn skip_if_no_ffmpeg() -> bool {
     std::process::Command::new("ffprobe")
         .arg("-version")
         .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
+        .map_or(true, |o| !o.status.success())
 }
 
 /// Generate a minimal 5-second test MP4 in `dir` using `ffmpeg`.
@@ -54,7 +53,10 @@ fn make_test_mp4(dir: &Path) -> Result<PathBuf> {
             "error",
         ])
         .status()?;
-    anyhow::ensure!(status.success(), "ffmpeg exited non-zero generating test mp4");
+    anyhow::ensure!(
+        status.success(),
+        "ffmpeg exited non-zero generating test mp4"
+    );
     Ok(out)
 }
 
@@ -117,7 +119,10 @@ async fn analyze_video_happy_path() -> Result<()> {
         .received_requests()
         .await
         .expect("wiremock requests");
-    assert!(!reqs.is_empty(), "wiremock must have received at least 1 request");
+    assert!(
+        !reqs.is_empty(),
+        "wiremock must have received at least 1 request"
+    );
 
     Ok(())
 }
