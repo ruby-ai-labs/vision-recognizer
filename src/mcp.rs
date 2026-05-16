@@ -145,13 +145,9 @@ impl VisionHandler {
             ));
         }
 
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
-
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
-
         // Retrieve duration (lazy ffmpeg check — returns helpful error if absent).
+        // Must run before OPENAI_API_KEY read so that a missing ffmpeg surfaces
+        // as an ffmpeg error, not a key error, when both are absent.
         let duration = video::video_duration_secs(path)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -165,6 +161,12 @@ impl VisionHandler {
                 None,
             ));
         }
+
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
+
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
 
         let fps = input.fps.unwrap_or(DEFAULT_FPS);
         let (_tempdir, frames) = video::extract_frames(path, fps, MAX_FRAMES)
