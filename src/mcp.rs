@@ -134,13 +134,7 @@ impl VisionHandler {
         &self,
         Parameters(input): Parameters<AnalyzeVideoInput>,
     ) -> Result<Json<AnalyzeVideoOutput>, ErrorData> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
-
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
-
-        // Validate video extension before touching the filesystem.
+        // Validate video extension first (cheap; no I/O, no env-reads).
         let path = std::path::Path::new(&input.video_path);
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -150,6 +144,12 @@ impl VisionHandler {
                 None,
             ));
         }
+
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
+
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
 
         // Retrieve duration (lazy ffmpeg check — returns helpful error if absent).
         let duration = video::video_duration_secs(path)
@@ -285,6 +285,59 @@ mod tests {
         assert!(
             result.is_err(),
             "must return Err when OPENAI_API_KEY is not set"
+        );
+    }
+
+    /// AC6 — unsupported extension returns `invalid_params` `ErrorData`.
+    #[tokio::test]
+    async fn analyze_video_unsupported_ext_returns_invalid_params() {
+        #![allow(clippy::expect_used)]
+        std::env::remove_var("OPENAI_API_KEY");
+        let handler = VisionHandler::new();
+        let input = AnalyzeVideoInput {
+            video_path: "/tmp/test.avi".to_owned(),
+            prompt: "describe".to_owned(),
+            fps: None,
+        };
+        let result = handler.analyze_video(Parameters(input)).await;
+        assert!(result.is_err(), "avi extension must return Err");
+        let err_data = result.err().expect("expected ErrorData");
+        let msg = err_data.message.as_ref();
+        assert!(
+            msg.contains("mp4") || msg.contains("unsupported"),
+            "error must mention supported formats, got: {msg}"
+        );
+    }
+
+    /// AC5 — missing `OPENAI_API_KEY` returns MCP `ErrorData`.
+    #[tokio::test]
+    async fn analyze_video_missing_key_returns_mcp_error() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let handler = VisionHandler::new();
+        // With a valid extension but non-existent file, ffprobe will fail (file
+        // doesn't exist or ffprobe not found) → `internal_error` returned.
+        // Confirms handler doesn't panic and always returns `ErrorData`.
+        let input = AnalyzeVideoInput {
+            video_path: "/tmp/nonexistent.mp4".to_owned(),
+            prompt: "describe".to_owned(),
+            fps: None,
+        };
+        let result = handler.analyze_video(Parameters(input)).await;
+        assert!(
+            result.is_err(),
+            "analyze_video with missing/invalid file must return Err"
+        );
+    }
+
+    /// AC1 — `get_info` instructions mention `analyze_video`.
+    #[test]
+    fn get_info_instructions_mention_analyze_video() {
+        let handler = VisionHandler::new();
+        let info = handler.get_info();
+        let instructions = info.instructions.as_deref().unwrap_or("");
+        assert!(
+            instructions.contains("vision.analyze_video"),
+            "get_info instructions must mention vision.analyze_video, got: {instructions}"
         );
     }
 }
