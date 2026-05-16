@@ -136,6 +136,18 @@ mod tests {
         );
     }
 
+    /// AC1: `VisionHandler` must expose a tool named `vision.analyze_video`.
+    #[test]
+    fn tool_router_lists_analyze_video() {
+        let handler = VisionHandler::new();
+        let tools = handler.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"vision.analyze_video"),
+            "tool list must contain vision.analyze_video, got: {names:?}"
+        );
+    }
+
     /// AC6: tool description contains USE WHEN / DO NOT USE guidance.
     #[test]
     fn tool_description_contains_when_to_use() {

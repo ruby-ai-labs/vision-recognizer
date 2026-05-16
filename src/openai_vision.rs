@@ -150,6 +150,10 @@ mod tests {
     // Tests legitimately use `?` propagation and assert! — unwrap/expect
     // are acceptable in test context; silenced here.
     use super::*;
+    use serde_json::Value;
+    use tempfile::NamedTempFile;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// AC6: `mime_for_ext` accepts jpeg and png extensions.
     #[test]
@@ -215,6 +219,98 @@ mod tests {
     #[test]
     fn client_new_does_not_panic() -> Result<()> {
         VisionClient::new("dummy-api-key", "http://localhost:8080")?;
+        Ok(())
+    }
+
+    // ── recognize_sequence tests (AC2, AC7) ───────────────────────────────
+
+    /// AC2/AC7: `recognize_sequence` builds a payload with N `image_url` items
+    /// (one per frame) followed by one `text` item; uses model `gpt-4o`.
+    #[tokio::test]
+    async fn recognize_sequence_builds_payload() -> Result<()> {
+        let mock_server = MockServer::start().await;
+
+        // Capture the request body so we can assert on payload shape.
+        let response_body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "test analysis"}}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Create 3 minimal PNG temp files.
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
+            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2,
+            0x21, 0xbc, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+            0x82,
+        ];
+
+        let mut tmp_files: Vec<NamedTempFile> = Vec::new();
+        let mut frame_paths: Vec<std::path::PathBuf> = Vec::new();
+        for _ in 0..3 {
+            let tmp = tempfile::Builder::new().suffix(".png").tempfile()?;
+            std::fs::write(tmp.path(), png_bytes)?;
+            frame_paths.push(tmp.path().to_path_buf());
+            tmp_files.push(tmp);
+        }
+
+        let client = VisionClient::new("sk-test", mock_server.uri())?;
+        let text = client
+            .recognize_sequence(&frame_paths, "describe movement", "gpt-4o")
+            .await?;
+
+        assert_eq!(text, "test analysis");
+
+        // Inspect the captured request to verify payload shape.
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly 1 request");
+
+        let body: Value = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(body["model"], "gpt-4o", "model must be gpt-4o");
+
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content must be array");
+
+        // Should be 3 image_url items + 1 text item = 4 total
+        assert_eq!(content.len(), 4, "expected 4 content items (3 images + 1 text)");
+
+        let image_items: Vec<&Value> = content
+            .iter()
+            .filter(|item| item["type"] == "image_url")
+            .collect();
+        assert_eq!(image_items.len(), 3, "expected 3 image_url items");
+
+        let text_items: Vec<&Value> = content
+            .iter()
+            .filter(|item| item["type"] == "text")
+            .collect();
+        assert_eq!(text_items.len(), 1, "expected 1 text item");
+        assert_eq!(text_items[0]["text"], "describe movement");
+
+        Ok(())
+    }
+
+    /// AC7 edge case: `recognize_sequence` with empty frames slice returns Err.
+    #[tokio::test]
+    async fn recognize_sequence_empty_frames() -> Result<()> {
+        let client = VisionClient::new("sk-test", "http://localhost:19999")?;
+        let result = client
+            .recognize_sequence(&[], "describe movement", "gpt-4o")
+            .await;
+        assert!(result.is_err(), "empty frames slice must return Err");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("frame") || msg.contains("empty"),
+            "error must mention frames or empty, got: {msg}"
+        );
         Ok(())
     }
 

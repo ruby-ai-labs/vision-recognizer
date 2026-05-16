@@ -4,3 +4,4 @@
 
 pub mod mcp;
 pub mod openai_vision;
+pub mod video;
