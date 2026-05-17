@@ -376,6 +376,12 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize all tests that mutate OPENAI_API_KEY to prevent race conditions
+    // when `cargo test` runs tests in parallel threads (unlike nextest which uses
+    // per-process isolation).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// AC6: `VisionHandler` must expose a tool named `vision.recognize_image`.
     #[test]
@@ -427,17 +433,24 @@ mod tests {
     }
 
     /// AC6: missing `OPENAI_API_KEY` returns MCP `ErrorData`.
-    #[tokio::test]
-    async fn recognize_image_missing_key_returns_mcp_error() {
-        // Remove key to ensure it's absent for this test
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn recognize_image_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         let input = RecognizeImageInput {
             image_path: "/tmp/test.png".to_owned(),
             prompt: "describe".to_owned(),
             model: None,
         };
-        let result = handler.recognize_image(Parameters(input)).await;
+        let result = rt.block_on(handler.recognize_image(Parameters(input)));
         assert!(
             result.is_err(),
             "must return Err when OPENAI_API_KEY is not set"
@@ -445,17 +458,24 @@ mod tests {
     }
 
     /// AC6 — unsupported extension returns `invalid_params` `ErrorData`.
-    #[tokio::test]
-    async fn analyze_video_unsupported_ext_returns_invalid_params() {
-        #![allow(clippy::expect_used)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn analyze_video_unsupported_ext_returns_invalid_params() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         let input = AnalyzeVideoInput {
             video_path: "/tmp/test.avi".to_owned(),
             prompt: "describe".to_owned(),
             fps: None,
         };
-        let result = handler.analyze_video(Parameters(input)).await;
+        let result = rt.block_on(handler.analyze_video(Parameters(input)));
         assert!(result.is_err(), "avi extension must return Err");
         let err_data = result.err().expect("expected ErrorData");
         let msg = err_data.message.as_ref();
@@ -466,9 +486,17 @@ mod tests {
     }
 
     /// AC5 — missing `OPENAI_API_KEY` returns MCP `ErrorData`.
-    #[tokio::test]
-    async fn analyze_video_missing_key_returns_mcp_error() {
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn analyze_video_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         // With a valid extension but non-existent file, ffprobe will fail (file
         // doesn't exist or ffprobe not found) → `internal_error` returned.
@@ -478,7 +506,7 @@ mod tests {
             prompt: "describe".to_owned(),
             fps: None,
         };
-        let result = handler.analyze_video(Parameters(input)).await;
+        let result = rt.block_on(handler.analyze_video(Parameters(input)));
         assert!(
             result.is_err(),
             "analyze_video with missing/invalid file must return Err"
@@ -512,10 +540,20 @@ mod tests {
     }
 
     /// AC4: missing `OPENAI_API_KEY` returns `ErrorData` with key name in message.
-    #[tokio::test]
+    ///
+    /// Uses a sync wrapper with `ENV_LOCK` to prevent races with other env-var
+    /// tests when `cargo test` runs tests in parallel threads.
+    #[test]
     #[allow(clippy::expect_used)]
-    async fn estimate_portion_missing_key_returns_mcp_error() {
+    fn estimate_portion_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         let input = EstimatePortionInput {
             image_path: "/tmp/test.png".to_owned(),
@@ -524,7 +562,7 @@ mod tests {
             prompt: None,
             model: None,
         };
-        let result = handler.estimate_portion(Parameters(input)).await;
+        let result = rt.block_on(handler.estimate_portion(Parameters(input)));
         assert!(
             result.is_err(),
             "must return Err when OPENAI_API_KEY is not set"
@@ -537,10 +575,21 @@ mod tests {
     }
 
     /// AC5: empty `foods_list` returns `ErrorData::invalid_params` without HTTP call.
-    #[tokio::test]
+    ///
+    /// Uses a sync wrapper with `ENV_LOCK` to prevent races with other env-var
+    /// tests when `cargo test` runs tests in parallel threads.
+    #[test]
     #[allow(clippy::expect_used)]
-    async fn estimate_portion_empty_foods_list_returns_invalid_params() {
+    fn estimate_portion_empty_foods_list_returns_invalid_params() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         // No wiremock server mounted — any outgoing HTTP call would panic/fail.
+        // Key is set so load_client() succeeds; rejection must happen before HTTP.
         std::env::set_var("OPENAI_API_KEY", "sk-test");
         let handler = VisionHandler::new();
         let input = EstimatePortionInput {
@@ -550,7 +599,7 @@ mod tests {
             prompt: None,
             model: None,
         };
-        let result = handler.estimate_portion(Parameters(input)).await;
+        let result = rt.block_on(handler.estimate_portion(Parameters(input)));
         assert!(result.is_err(), "empty foods_list must return Err");
         let err = result.err().expect("expected ErrorData");
         // invalid_params has code -32602
@@ -560,6 +609,8 @@ mod tests {
             "must be invalid_params error code, got: {:?}",
             err.code
         );
+        // Clean up to avoid leaking env var to subsequent tests.
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     /// AC3: `build_portion_prompt` includes reference text when provided.
