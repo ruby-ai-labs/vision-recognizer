@@ -2,12 +2,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+use rmcp::{handler::server::wrapper::Parameters, Json};
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
-use vision_recognizer::openai_vision::VisionClient;
+use vision_recognizer::{
+    mcp::{EstimatePortionInput, EstimatePortionOutput, VisionHandler},
+    openai_vision::VisionClient,
+};
 use wiremock::{
-    matchers::{method, path},
+    matchers::{body_string_contains, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -100,5 +104,153 @@ async fn returns_ok_on_200_with_valid_response() -> Result<()> {
     let text = client.recognize(&path, "describe", "gpt-4o-mini").await?;
 
     assert_eq!(text, "A white square image.");
+    Ok(())
+}
+
+// ── estimate_portion integration tests (AC2, AC3, AC6) ────────────────────
+
+/// AC2: `estimate_portion` happy path — wiremock returns valid JSON, handler
+/// parses and returns `EstimatePortionOutput` with at least one item.
+#[tokio::test]
+async fn estimate_portion_happy_path() -> Result<()> {
+    let mock_server = MockServer::start().await;
+    let response_body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"items\":[{\"name\":\"плов\",\"estimated_grams\":\"250\",\"confidence\":\"high\",\"reasoning\":\"тарелка диаметром 25 см\"}]}"
+            }
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, img_path) = make_temp_png()?;
+    std::env::set_var("OPENAI_API_KEY", "sk-test");
+    std::env::set_var("OPENAI_BASE_URL", mock_server.uri());
+
+    let handler = VisionHandler::new();
+    let input = EstimatePortionInput {
+        image_path: img_path.to_string_lossy().to_string(),
+        foods_list: vec!["плов".to_owned()],
+        reference: None,
+        prompt: None,
+        model: None,
+    };
+    let result: Json<EstimatePortionOutput> = handler
+        .estimate_portion(Parameters(input))
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+    assert_eq!(result.0.items.len(), 1, "expected 1 item");
+    assert_eq!(result.0.items[0].name, "плов");
+    assert_eq!(result.0.items[0].estimated_grams, "250");
+    assert_eq!(result.0.items[0].confidence, "high");
+    assert!(
+        !result.0.items[0].reasoning.is_empty(),
+        "reasoning must not be empty"
+    );
+
+    std::env::remove_var("OPENAI_BASE_URL");
+    Ok(())
+}
+
+/// AC6: `estimate_portion` strips markdown fences from LLM response and parses
+/// correctly.
+#[tokio::test]
+async fn estimate_portion_markdown_wrap_stripped() -> Result<()> {
+    let mock_server = MockServer::start().await;
+    // LLM wraps its response in markdown code fences despite instructions.
+    let response_body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "```json\n{\"items\":[{\"name\":\"рис\",\"estimated_grams\":\"150\",\"confidence\":\"med\",\"reasoning\":\"стандартная порция\"}]}\n```"
+            }
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, img_path) = make_temp_png()?;
+    std::env::set_var("OPENAI_API_KEY", "sk-test");
+    std::env::set_var("OPENAI_BASE_URL", mock_server.uri());
+
+    let handler = VisionHandler::new();
+    let input = EstimatePortionInput {
+        image_path: img_path.to_string_lossy().to_string(),
+        foods_list: vec!["рис".to_owned()],
+        reference: None,
+        prompt: None,
+        model: None,
+    };
+    let result: Json<EstimatePortionOutput> = handler
+        .estimate_portion(Parameters(input))
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+    assert_eq!(
+        result.0.items.len(),
+        1,
+        "expected 1 item after fence stripping"
+    );
+    assert_eq!(result.0.items[0].name, "рис");
+    assert_eq!(result.0.items[0].estimated_grams, "150");
+
+    std::env::remove_var("OPENAI_BASE_URL");
+    Ok(())
+}
+
+/// AC3: `estimate_portion` with reference text — wiremock verifies reference
+/// string appears in the request body sent to `OpenAI`.
+#[tokio::test]
+async fn estimate_portion_reference_in_prompt() -> Result<()> {
+    let mock_server = MockServer::start().await;
+    let response_body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"items\":[{\"name\":\"курица\",\"estimated_grams\":\"200\",\"confidence\":\"med\",\"reasoning\":\"ориентир — ладонь\"}]}"
+            }
+        }]
+    });
+
+    // Assert that the request body contains the reference text.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("ладонь рядом"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, img_path) = make_temp_png()?;
+    std::env::set_var("OPENAI_API_KEY", "sk-test");
+    std::env::set_var("OPENAI_BASE_URL", mock_server.uri());
+
+    let handler = VisionHandler::new();
+    let input = EstimatePortionInput {
+        image_path: img_path.to_string_lossy().to_string(),
+        foods_list: vec!["курица".to_owned()],
+        reference: Some("ладонь рядом".to_owned()),
+        prompt: None,
+        model: None,
+    };
+    let result: Json<EstimatePortionOutput> = handler
+        .estimate_portion(Parameters(input))
+        .await
+        .map_err(|e| anyhow::anyhow!("handler returned error: {}", e.message))?;
+
+    assert_eq!(result.0.items.len(), 1);
+    assert_eq!(result.0.items[0].name, "курица");
+
+    std::env::remove_var("OPENAI_BASE_URL");
     Ok(())
 }

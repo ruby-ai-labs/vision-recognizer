@@ -66,7 +66,7 @@ pub(crate) struct AnalyzeVideoOutput {
 
 /// Input schema for `vision.estimate_portion`.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct EstimatePortionInput {
+pub struct EstimatePortionInput {
     /// Absolute path to the image file (jpeg, png, webp, gif).
     pub image_path: String,
 
@@ -87,7 +87,7 @@ pub(crate) struct EstimatePortionInput {
 
 /// A single food item with portion estimate.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct PortionItem {
+pub struct PortionItem {
     /// Food item name.
     pub name: String,
 
@@ -105,7 +105,7 @@ pub(crate) struct PortionItem {
 
 /// Output wrapper for `vision.estimate_portion`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct EstimatePortionOutput {
+pub struct EstimatePortionOutput {
     /// Portion estimates for each food item.
     pub items: Vec<PortionItem>,
 }
@@ -136,7 +136,8 @@ fn load_client() -> Result<VisionClient, ErrorData> {
 /// `foods` — list of food items to estimate.
 /// `reference` — optional reference object for size calibration.
 /// `custom_prompt` — if `Some`, overrides the default prompt entirely.
-pub(crate) fn build_portion_prompt(
+#[must_use]
+pub fn build_portion_prompt(
     foods: &[String],
     reference: Option<&str>,
     custom_prompt: Option<&str>,
@@ -178,15 +179,16 @@ fn strip_markdown_fences(s: &str) -> &str {
 // ── Handler ────────────────────────────────────────────────────────────────
 
 /// MCP handler that exposes vision recognition tools.
-#[derive(Clone)]
-pub(crate) struct VisionHandler {
+#[derive(Clone, Default)]
+pub struct VisionHandler {
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl VisionHandler {
     /// Create a new handler.
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
         }
