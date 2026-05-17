@@ -342,4 +342,87 @@ mod tests {
             "get_info instructions must mention vision.analyze_video, got: {instructions}"
         );
     }
+
+    // ── estimate_portion tests (AC1, AC4, AC5) — TDD red phase ───────────────
+
+    /// AC1: `VisionHandler` must expose a tool named `vision.estimate_portion`.
+    #[test]
+    fn tool_router_lists_estimate_portion() {
+        let handler = VisionHandler::new();
+        let tools = handler.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"vision.estimate_portion"),
+            "tool list must contain vision.estimate_portion, got: {names:?}"
+        );
+    }
+
+    /// AC4: missing `OPENAI_API_KEY` returns `ErrorData` with key name in message.
+    #[tokio::test]
+    async fn estimate_portion_missing_key_returns_mcp_error() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let handler = VisionHandler::new();
+        let input = EstimatePortionInput {
+            image_path: "/tmp/test.png".to_owned(),
+            foods_list: vec!["плов".to_owned()],
+            reference: None,
+            prompt: None,
+            model: None,
+        };
+        let result = handler.estimate_portion(Parameters(input)).await;
+        assert!(
+            result.is_err(),
+            "must return Err when OPENAI_API_KEY is not set"
+        );
+        let msg = result.unwrap_err().message;
+        assert!(
+            msg.contains("OPENAI_API_KEY"),
+            "error must mention OPENAI_API_KEY, got: {msg}"
+        );
+    }
+
+    /// AC5: empty `foods_list` returns `ErrorData::invalid_params` without HTTP call.
+    #[tokio::test]
+    async fn estimate_portion_empty_foods_list_returns_invalid_params() {
+        // No wiremock server mounted — any outgoing HTTP call would panic/fail.
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let handler = VisionHandler::new();
+        let input = EstimatePortionInput {
+            image_path: "/tmp/test.png".to_owned(),
+            foods_list: vec![],
+            reference: None,
+            prompt: None,
+            model: None,
+        };
+        let result = handler.estimate_portion(Parameters(input)).await;
+        assert!(result.is_err(), "empty foods_list must return Err");
+        let err = result.unwrap_err();
+        // invalid_params has code -32602
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "must be invalid_params error code, got: {:?}",
+            err.code
+        );
+    }
+
+    /// AC3: `build_portion_prompt` includes reference text when provided.
+    #[test]
+    fn estimate_portion_reference_included_in_prompt() {
+        let prompt = build_portion_prompt(&["плов".to_owned()], Some("ладонь"), None);
+        assert!(
+            prompt.contains("ладонь"),
+            "prompt must contain reference 'ладонь', got: {prompt}"
+        );
+    }
+
+    /// AC3 negative: `build_portion_prompt` without reference does not add calibration text.
+    #[test]
+    fn estimate_portion_no_reference_omits_calibration() {
+        let prompt = build_portion_prompt(&["плов".to_owned()], None, None);
+        assert!(
+            !prompt.contains("Reference object"),
+            "prompt without reference must not mention Reference object, got: {prompt}"
+        );
+    }
 }
