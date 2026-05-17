@@ -1,8 +1,9 @@
 //! MCP stdio server for vision-recognizer.
 //!
-//! Exposes two tools:
-//! - `vision.recognize_image` — analyses a single image file via the `OpenAI` Vision API.
-//! - `vision.analyze_video`   — extracts frames from a video and analyses the sequence.
+//! Exposes three tools:
+//! - `vision.recognize_image`   — analyses a single image file via the `OpenAI` Vision API.
+//! - `vision.analyze_video`     — extracts frames from a video and analyses the sequence.
+//! - `vision.estimate_portion`  — estimates food portion weights from a photo.
 
 use anyhow::Result;
 use rmcp::{
@@ -63,18 +64,131 @@ pub(crate) struct AnalyzeVideoOutput {
     pub text: String,
 }
 
+/// Input schema for `vision.estimate_portion`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EstimatePortionInput {
+    /// Absolute path to the image file (jpeg, png, webp, gif).
+    pub image_path: String,
+
+    /// List of food items visible in the image to estimate portions for.
+    pub foods_list: Vec<String>,
+
+    /// Optional reference object visible in the image used for size calibration
+    /// (e.g. "a hand next to the plate").
+    pub reference: Option<String>,
+
+    /// Optional custom prompt override. When provided, replaces the default
+    /// dietitian prompt entirely.
+    pub prompt: Option<String>,
+
+    /// `OpenAI` model override (optional, default: `gpt-4o`).
+    pub model: Option<String>,
+}
+
+/// A single food item with portion estimate.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PortionItem {
+    /// Food item name.
+    pub name: String,
+
+    /// Estimated weight in grams (may be a range like "150-200" or float
+    /// string like "175.5" — `String` type absorbs LLM variability).
+    pub estimated_grams: String,
+
+    /// Confidence level: typically "low", "med", or "high".
+    /// `String` type to absorb LLM output variability without panicking.
+    pub confidence: String,
+
+    /// Brief reasoning for the estimate (e.g. plate diameter, reference object).
+    pub reasoning: String,
+}
+
+/// Output wrapper for `vision.estimate_portion`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EstimatePortionOutput {
+    /// Portion estimates for each food item.
+    pub items: Vec<PortionItem>,
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Load `VisionClient` from environment variables.
+///
+/// Reads `OPENAI_API_KEY` (required) and `OPENAI_BASE_URL` (optional,
+/// defaults to `"https://api.openai.com"`).
+///
+/// # Errors
+///
+/// Returns `ErrorData::internal_error` when `OPENAI_API_KEY` is not set or
+/// when the HTTP client cannot be initialised.
+fn load_client() -> Result<VisionClient, ErrorData> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
+
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_owned());
+
+    VisionClient::new(api_key, base_url).map_err(|e| ErrorData::internal_error(e.to_string(), None))
+}
+
+/// Build the dietitian prompt for portion estimation.
+///
+/// `foods` — list of food items to estimate.
+/// `reference` — optional reference object for size calibration.
+/// `custom_prompt` — if `Some`, overrides the default prompt entirely.
+#[must_use]
+pub fn build_portion_prompt(
+    foods: &[String],
+    reference: Option<&str>,
+    custom_prompt: Option<&str>,
+) -> String {
+    if let Some(p) = custom_prompt {
+        return p.to_owned();
+    }
+
+    let foods_joined = foods.join(", ");
+    let reference_line = reference
+        .map(|r| format!("Reference object visible: {r}. Use it to calibrate portion size.\n"))
+        .unwrap_or_default();
+
+    format!(
+        "You are a dietitian estimating food portion weights.\n\
+         Foods identified: {foods_joined}.\n\
+         {reference_line}\
+         Estimate the weight in grams for each item. Be concise in reasoning (one short sentence).\n\
+         Respond ONLY with valid JSON matching exactly:\n\
+         {{\"items\":[{{\"name\":\"...\",\"estimated_grams\":\"150\",\"confidence\":\"high\",\"reasoning\":\"...\"}}]}}\n\
+         No markdown fences. No explanation outside JSON."
+    )
+}
+
+/// Strip markdown code fences from an LLM response string.
+///
+/// Handles ` ```json\n...\n``` ` and ` ```\n...\n``` ` wrapping that some
+/// models emit despite instructions.
+fn strip_markdown_fences(s: &str) -> &str {
+    let s = s.trim();
+    let s = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    let s = s.strip_suffix("```").unwrap_or(s);
+    s.trim()
+}
+
 // ── Handler ────────────────────────────────────────────────────────────────
 
 /// MCP handler that exposes vision recognition tools.
-#[derive(Clone)]
-pub(crate) struct VisionHandler {
+#[derive(Clone, Default)]
+pub struct VisionHandler {
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl VisionHandler {
     /// Create a new handler.
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
         }
@@ -97,14 +211,7 @@ impl VisionHandler {
         &self,
         Parameters(input): Parameters<RecognizeImageInput>,
     ) -> Result<Json<RecognizeImageOutput>, ErrorData> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
-
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
-
-        let client = VisionClient::new(api_key, base_url)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let client = load_client()?;
 
         let model = input.model.as_deref().unwrap_or("gpt-4o-mini");
         let path = std::path::PathBuf::from(&input.image_path);
@@ -162,19 +269,12 @@ impl VisionHandler {
             ));
         }
 
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ErrorData::internal_error("OPENAI_API_KEY is not set".to_owned(), None))?;
-
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com".to_owned());
-
         let fps = input.fps.unwrap_or(DEFAULT_FPS);
         let (_tempdir, frames) = video::extract_frames(path, fps, MAX_FRAMES)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let client = VisionClient::new(api_key, base_url)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let client = load_client()?;
 
         let text = client
             .recognize_sequence(&frames, &input.prompt, "gpt-4o")
@@ -183,6 +283,58 @@ impl VisionHandler {
 
         // _tempdir lives until end of scope — frames are valid for the HTTP call above.
         Ok(Json(AnalyzeVideoOutput { text }))
+    }
+
+    /// `vision.estimate_portion` — estimate food portion weights from a photo.
+    #[tool(
+        name = "vision.estimate_portion",
+        description = "Estimate food portion weights (in grams) from a photo using OpenAI Vision API (gpt-4o by default). \
+                       Provide a list of food items visible in the image; optionally include a reference object \
+                       (e.g. a hand or plate) for size calibration. \
+                       Reads OPENAI_API_KEY from environment. \
+                       Returns a list of items with estimated_grams, confidence, and reasoning. \
+                       USE WHEN: user wants to estimate how many grams of food are on a photo; \
+                       user sends a food photo and asks about portion size or calorie estimation; \
+                       user needs weight estimates for meal tracking. \
+                       DO NOT USE for video files — use vision.analyze_video; \
+                       DO NOT USE if foods_list is empty (validation error will be returned)."
+    )]
+    pub async fn estimate_portion(
+        &self,
+        Parameters(input): Parameters<EstimatePortionInput>,
+    ) -> Result<Json<EstimatePortionOutput>, ErrorData> {
+        // AC5: reject empty foods_list immediately — no HTTP call.
+        if input.foods_list.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "foods_list must not be empty — provide at least one food item".to_owned(),
+                None,
+            ));
+        }
+
+        let client = load_client()?;
+
+        let model = input.model.as_deref().unwrap_or("gpt-4o");
+        let path = std::path::PathBuf::from(&input.image_path);
+        let prompt = build_portion_prompt(
+            &input.foods_list,
+            input.reference.as_deref(),
+            input.prompt.as_deref(),
+        );
+
+        let raw = client
+            .recognize(&path, &prompt, model)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let stripped = strip_markdown_fences(&raw);
+        let output: EstimatePortionOutput = serde_json::from_str(stripped).map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to parse portion JSON from LLM response: {e}; raw: {stripped}"),
+                None,
+            )
+        })?;
+
+        Ok(Json(output))
     }
 }
 
@@ -198,7 +350,9 @@ impl ServerHandler for VisionHandler {
                 "Vision recognition tools powered by OpenAI Vision API. \
                  Use vision.recognize_image to analyze images. \
                  Use vision.analyze_video to analyze short video clips (mp4/mov/webm, max 30s) \
-                 — USE WHEN: video file / motion analysis; DO NOT USE for single images.",
+                 — USE WHEN: video file / motion analysis; DO NOT USE for single images. \
+                 Use vision.estimate_portion to estimate food portion weights in grams from a photo \
+                 — USE WHEN: user asks about portion size or grams for meal tracking.",
             )
     }
 }
@@ -222,6 +376,12 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize all tests that mutate OPENAI_API_KEY to prevent race conditions
+    // when `cargo test` runs tests in parallel threads (unlike nextest which uses
+    // per-process isolation).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// AC6: `VisionHandler` must expose a tool named `vision.recognize_image`.
     #[test]
@@ -273,17 +433,24 @@ mod tests {
     }
 
     /// AC6: missing `OPENAI_API_KEY` returns MCP `ErrorData`.
-    #[tokio::test]
-    async fn recognize_image_missing_key_returns_mcp_error() {
-        // Remove key to ensure it's absent for this test
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn recognize_image_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         let input = RecognizeImageInput {
             image_path: "/tmp/test.png".to_owned(),
             prompt: "describe".to_owned(),
             model: None,
         };
-        let result = handler.recognize_image(Parameters(input)).await;
+        let result = rt.block_on(handler.recognize_image(Parameters(input)));
         assert!(
             result.is_err(),
             "must return Err when OPENAI_API_KEY is not set"
@@ -291,17 +458,24 @@ mod tests {
     }
 
     /// AC6 — unsupported extension returns `invalid_params` `ErrorData`.
-    #[tokio::test]
-    async fn analyze_video_unsupported_ext_returns_invalid_params() {
-        #![allow(clippy::expect_used)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn analyze_video_unsupported_ext_returns_invalid_params() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         let input = AnalyzeVideoInput {
             video_path: "/tmp/test.avi".to_owned(),
             prompt: "describe".to_owned(),
             fps: None,
         };
-        let result = handler.analyze_video(Parameters(input)).await;
+        let result = rt.block_on(handler.analyze_video(Parameters(input)));
         assert!(result.is_err(), "avi extension must return Err");
         let err_data = result.err().expect("expected ErrorData");
         let msg = err_data.message.as_ref();
@@ -312,9 +486,17 @@ mod tests {
     }
 
     /// AC5 — missing `OPENAI_API_KEY` returns MCP `ErrorData`.
-    #[tokio::test]
-    async fn analyze_video_missing_key_returns_mcp_error() {
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn analyze_video_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         let handler = VisionHandler::new();
         // With a valid extension but non-existent file, ffprobe will fail (file
         // doesn't exist or ffprobe not found) → `internal_error` returned.
@@ -324,7 +506,7 @@ mod tests {
             prompt: "describe".to_owned(),
             fps: None,
         };
-        let result = handler.analyze_video(Parameters(input)).await;
+        let result = rt.block_on(handler.analyze_video(Parameters(input)));
         assert!(
             result.is_err(),
             "analyze_video with missing/invalid file must return Err"
@@ -340,6 +522,114 @@ mod tests {
         assert!(
             instructions.contains("vision.analyze_video"),
             "get_info instructions must mention vision.analyze_video, got: {instructions}"
+        );
+    }
+
+    // ── estimate_portion tests (AC1, AC4, AC5) — TDD red phase ───────────────
+
+    /// AC1: `VisionHandler` must expose a tool named `vision.estimate_portion`.
+    #[test]
+    fn tool_router_lists_estimate_portion() {
+        let handler = VisionHandler::new();
+        let tools = handler.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"vision.estimate_portion"),
+            "tool list must contain vision.estimate_portion, got: {names:?}"
+        );
+    }
+
+    /// AC4: missing `OPENAI_API_KEY` returns `ErrorData` with key name in message.
+    ///
+    /// Uses a sync wrapper with `ENV_LOCK` to prevent races with other env-var
+    /// tests when `cargo test` runs tests in parallel threads.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn estimate_portion_missing_key_returns_mcp_error() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("OPENAI_API_KEY");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handler = VisionHandler::new();
+        let input = EstimatePortionInput {
+            image_path: "/tmp/test.png".to_owned(),
+            foods_list: vec!["плов".to_owned()],
+            reference: None,
+            prompt: None,
+            model: None,
+        };
+        let result = rt.block_on(handler.estimate_portion(Parameters(input)));
+        assert!(
+            result.is_err(),
+            "must return Err when OPENAI_API_KEY is not set"
+        );
+        let msg = result.err().expect("expected ErrorData").message;
+        assert!(
+            msg.contains("OPENAI_API_KEY"),
+            "error must mention OPENAI_API_KEY, got: {msg}"
+        );
+    }
+
+    /// AC5: empty `foods_list` returns `ErrorData::invalid_params` without HTTP call.
+    ///
+    /// Uses a sync wrapper with `ENV_LOCK` to prevent races with other env-var
+    /// tests when `cargo test` runs tests in parallel threads.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn estimate_portion_empty_foods_list_returns_invalid_params() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        // No wiremock server mounted — any outgoing HTTP call would panic/fail.
+        // Key is set so load_client() succeeds; rejection must happen before HTTP.
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let handler = VisionHandler::new();
+        let input = EstimatePortionInput {
+            image_path: "/tmp/test.png".to_owned(),
+            foods_list: vec![],
+            reference: None,
+            prompt: None,
+            model: None,
+        };
+        let result = rt.block_on(handler.estimate_portion(Parameters(input)));
+        assert!(result.is_err(), "empty foods_list must return Err");
+        let err = result.err().expect("expected ErrorData");
+        // invalid_params has code -32602
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "must be invalid_params error code, got: {:?}",
+            err.code
+        );
+        // Clean up to avoid leaking env var to subsequent tests.
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    /// AC3: `build_portion_prompt` includes reference text when provided.
+    #[test]
+    fn estimate_portion_reference_included_in_prompt() {
+        let prompt = build_portion_prompt(&["плов".to_owned()], Some("ладонь"), None);
+        assert!(
+            prompt.contains("ладонь"),
+            "prompt must contain reference 'ладонь', got: {prompt}"
+        );
+    }
+
+    /// AC3 negative: `build_portion_prompt` without reference does not add calibration text.
+    #[test]
+    fn estimate_portion_no_reference_omits_calibration() {
+        let prompt = build_portion_prompt(&["плов".to_owned()], None, None);
+        assert!(
+            !prompt.contains("Reference object"),
+            "prompt without reference must not mention Reference object, got: {prompt}"
         );
     }
 }
